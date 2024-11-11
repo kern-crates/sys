@@ -3,14 +3,17 @@
 use core::sync::atomic::Ordering;
 use taskctx::Tid;
 use axtype::PAGE_SIZE;
-use axconfig::TASK_STACK_SIZE;
-#[cfg(target_arch = "x86_64")]
-use axerrno::linux_err;
 use axerrno::{LinuxResult, LinuxError, linux_err_from};
 use taskctx::TaskState;
+use axtype::{RLimit64, RLIM_NLIMITS};
+use axtype::{RLIMIT_DATA, RLIMIT_STACK, RLIMIT_CORE, RLIMIT_NOFILE};
+pub use futex::{do_futex, FUTEX_WAKE};
+
+mod futex;
 
 #[macro_use]
 extern crate log;
+extern crate alloc;
 
 const WNOHANG: usize = 0x00000001;
 const WEXITED: usize = 0x00000004;
@@ -23,21 +26,6 @@ const EXIT_TRACE: usize = EXIT_ZOMBIE | EXIT_DEAD;
 
 #[cfg(target_arch = "x86_64")]
 const ARCH_SET_FS: usize = 0x1002;
-
-const RLIMIT_STACK: usize = 3; /* max stack size */
-//const RLIM_NLIMITS: usize = 16;
-
-#[allow(dead_code)]
-struct RLimit64 {
-    rlim_cur: u64,
-    rlim_max: u64,
-}
-
-impl RLimit64 {
-    pub fn new(rlim_cur: u64, rlim_max: u64) -> Self {
-        Self { rlim_cur, rlim_max }
-    }
-}
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq)]
@@ -64,37 +52,37 @@ pub fn getppid() -> usize {
 }
 
 pub fn getgid() -> usize {
-    warn!("impl getgid");
+    let task = task::current();
+    let cred = task.cred.lock();
+    cred.gid as usize
+}
+
+pub fn getegid() -> usize {
+    let task = task::current();
+    let cred = task.cred.lock();
+    cred.egid as usize
+}
+
+pub fn setpgid(pid: usize, pgid: usize) -> usize {
+    warn!("impl setpgid pid {} pgid {}", pid, pgid);
     0
 }
 
-pub fn setpgid() -> usize {
-    warn!("impl setpgid");
-    0
-}
-
+// Refer to "include/asm-generic/resource.h"
 pub fn prlimit64(tid: Tid, resource: usize, new_rlim: usize, old_rlim: usize) -> usize {
-    warn!(
+    info!(
         "linux_syscall_prlimit64: tid {}, resource: {}, {:?} {:?}",
         tid, resource, new_rlim, old_rlim
     );
-
     assert!(tid == 0);
-
-    let old_rlim = old_rlim as *mut RLimit64;
-
-    match resource {
-        RLIMIT_STACK => {
-            let stack_size = TASK_STACK_SIZE as u64;
-            unsafe {
-                *old_rlim = RLimit64::new(stack_size, stack_size);
-            }
-            0
-        }
-        _ => {
-            unimplemented!("Resource Type: {}", resource);
-        }
+    assert!(resource < RLIM_NLIMITS);
+    assert!(matches!(resource, RLIMIT_DATA|RLIMIT_STACK|RLIMIT_CORE|RLIMIT_NOFILE));
+    let current = task::current();
+    if old_rlim != 0 {
+        let old_rlim = old_rlim as *mut RLimit64;
+        unsafe { *old_rlim = current.rlim[resource]; }
     }
+    0
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -117,6 +105,55 @@ pub fn arch_prctl(code: usize, addr: usize) -> usize {
     }
 }
 
+pub fn setuid(uid: usize) -> usize {
+    let task = task::current();
+    let mut cred = task.cred.lock();
+    cred.uid = uid as u32;
+    cred.euid = uid as u32;
+    cred.fsuid = uid as u32;
+    // Todo: handle [suid] according to capability
+    0
+}
+
+pub fn setreuid(ruid: usize, euid: usize) -> usize {
+    info!("setresuid: {:#x}, {:#x}", ruid, euid);
+    let ruid = ruid as u32;
+    let euid = euid as u32;
+
+    let task = task::current();
+    let mut cred = task.cred.lock();
+    cred.uid = ruid;
+    cred.euid = euid;
+    cred.fsuid = euid;
+    0
+}
+
+pub fn setresuid(ruid: usize, euid: usize, suid: usize) -> usize {
+    info!("setresuid: {:#x}, {:#x}, {:#x}", ruid, euid, suid);
+    let ruid = ruid as u32;
+    let euid = euid as u32;
+    let suid = suid as u32;
+
+    let task = task::current();
+    let mut cred = task.cred.lock();
+    cred.uid = ruid;
+    cred.euid = euid;
+    cred.suid = suid;
+    cred.fsuid = euid;
+    0
+}
+
+pub fn setgid(gid: usize) -> usize {
+    info!("setgid: {}", gid);
+    let task = task::current();
+    let mut cred = task.cred.lock();
+    cred.gid = gid as u32;
+    cred.egid = gid as u32;
+    cred.fsgid = gid as u32;
+    // Todo: handle [sgid] according to capability
+    0
+}
+
 pub fn wait4(pid: usize, wstatus: usize, options: usize, rusage: usize) -> usize {
     let pid = pid as isize;
     info!("wait4: pid {:#X} wstatus {:#X} options {:#X} rusage {:#X}",
@@ -130,7 +167,9 @@ pub fn wait4(pid: usize, wstatus: usize, options: usize, rusage: usize) -> usize
         // Todo: deal with options in future.
         warn!("+++ Handle options in wait4 +++");
     }
-    assert!((options & WNOHANG) == 0);
+    if (options & WNOHANG) != 0 {
+        warn!("WNOHANG");
+    }
 
     let pid_type =
         if pid == -1 {
@@ -152,9 +191,11 @@ pub fn wait4(pid: usize, wstatus: usize, options: usize, rusage: usize) -> usize
         //Err(e) => panic!("do_wait err: {:?}", e),
     };
 
-    let wstatus = wstatus as *mut u32;
-    unsafe {
-        (*wstatus) = status;
+    if wstatus != 0 {
+        let wstatus = wstatus as *mut u32;
+        unsafe {
+            (*wstatus) = status;
+        }
     }
     tid
 }
@@ -252,14 +293,28 @@ fn wait_task_zombie(tid: Tid, status: &mut u32) -> Option<Tid> {
 
 /// Exits the current task.
 pub fn exit(exit_code: u32) -> ! {
-    info!("task {} exit ...", taskctx::current_ctx().tid());
+    info!("task {} exit [{}] ...", taskctx::current_ctx().tid(), exit_code);
     do_exit(exit_code)
 }
 
 /// Exits the current task group.
 pub fn exit_group(exit_code: u32) -> ! {
     info!("exit_group ... [{}]", exit_code);
+    do_group_exit(exit_code)
+}
+
+pub fn do_group_exit(exit_code: u32) -> ! {
+    debug!("do_exit_group ... [{}]", exit_code);
     do_exit(exit_code)
+}
+
+pub fn do_umask(mode: u32) -> usize {
+    // Todo: use umask for mknot & open(create)
+    assert_eq!(mode, 0);
+    let current = task::current();
+    let mut fs = current.fs.lock();
+    fs.set_umask(mode);
+    0
 }
 
 fn do_exit(exit_code: u32) -> ! {
@@ -268,14 +323,49 @@ fn do_exit(exit_code: u32) -> ! {
     do_task_dead()
 }
 
+fn exit_mm_release() {
+    // futex_exit_release(tsk);
+    mm_release();
+}
+
+fn mm_release() {
+    let mut ctx = task::current_ctx();
+    // Todo: temporary solution.
+    // If I'm the main-thread, I don't need to notify parent by futex.
+    if ctx.group_leader.is_none() {
+        return;
+    }
+    if ctx.clear_child_tid != 0 {
+        put_user_u32(0, ctx.clear_child_tid);
+        do_futex(ctx.clear_child_tid, FUTEX_WAKE, 1, 0, 0, 0);
+        ctx.as_ctx_mut().clear_child_tid = 0;
+    }
+}
+
+fn put_user_u32(val: u32, pos: usize) -> usize {
+    let ptr = pos as *mut u32;
+    unsafe { *ptr = val; }
+    pos + 4
+}
+
 // Todo: implement it in mm.drop
 fn exit_mm() {
     let task = task::current();
+
+    exit_mm_release();
+
     if task.sched_info.group_leader.is_some() {
         // Todo: dont release mm for threads.
         // It's just a temp solution. Implement page refcount.
         return;
     }
+
+    if task.has_vfork_done() {
+        // Todo: this is a temporary solution.
+        // We need mm.drop to handle it automatically.
+        return;
+    }
+
     let mm = task.mm();
     let mut locked_mm = mm.lock();
     loop {
@@ -290,9 +380,11 @@ fn exit_mm() {
 
 fn exit_notify(exit_code: u32) {
     let task = task::current();
+    debug!("exit_notify: tid {} code {}", task.tid(), exit_code);
     task.exit_code.store(exit_code, Ordering::Relaxed);
     task.exit_state.store(EXIT_ZOMBIE, Ordering::Relaxed);
     // Todo: wakeup parent
+    task.complete_vfork_done();
 }
 
 fn do_task_dead() -> ! {
